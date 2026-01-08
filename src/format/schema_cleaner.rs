@@ -114,7 +114,7 @@ fn clean_json_schema_recursive(schema: &mut Value) {
     }
 
     // Handle type arrays: ["string", "null"] -> "string" with nullable: true
-    if let Some(type_val) = obj.get_mut("type") {
+    if let Some(type_val) = obj.get("type").cloned() {
         if let Some(arr) = type_val.as_array() {
             let has_null = arr.iter().any(|v| v.as_str() == Some("null"));
             let non_null: Vec<_> = arr
@@ -128,7 +128,7 @@ fn clean_json_schema_recursive(schema: &mut Value) {
             }
             
             if non_null.len() == 1 {
-                *type_val = non_null[0].clone();
+                obj.insert("type".to_string(), non_null[0].clone());
             } else if non_null.len() > 1 {
                 // Convert to anyOf format
                 let any_of: Vec<Value> = non_null

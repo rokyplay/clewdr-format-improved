@@ -60,7 +60,7 @@ where
     fn from(str: S) -> Self {
         Message::new_blocks(
             Role::Assistant,
-            vec![ContentBlock::Text { text: str.into() }],
+            vec![ContentBlock::Text { text: str.into(), cache_control: None }],
         )
     }
 }

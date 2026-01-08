@@ -10,7 +10,6 @@
 
 use crate::types::claude::{ContentBlock, DocumentSource, ImageSource, ImageUrl};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use serde_json::Value;
 
 /// Supported image media types
 pub const SUPPORTED_IMAGE_TYPES: &[&str] = &[
@@ -46,6 +45,21 @@ pub fn oai_image_url_to_claude(image_url: &ImageUrl) -> Option<ContentBlock> {
     // Handle data URI
     if url.starts_with("data:") {
         let source = extract_image_from_data_uri(url)?;
+        
+        // Validate media type is supported
+        if !is_supported_image_type(&source.media_type) && !is_supported_document_type(&source.media_type) {
+            tracing::warn!(
+                "[ImageConverter] Unsupported media type: {}, keeping as-is",
+                source.media_type
+            );
+        }
+        
+        // Validate base64 data
+        if !is_valid_base64(&source.data) {
+            tracing::warn!("[ImageConverter] Invalid base64 data in image URL");
+            return None;
+        }
+        
         return Some(ContentBlock::Image {
             source,
             cache_control: None,
@@ -55,6 +69,11 @@ pub fn oai_image_url_to_claude(image_url: &ImageUrl) -> Option<ContentBlock> {
     // Handle HTTP/HTTPS URLs - keep as ImageUrl for now
     // A full implementation would download and convert to base64
     if url.starts_with("http://") || url.starts_with("https://") {
+        // Check if URL looks like an image by extension
+        let media_type = infer_media_type_from_url(url);
+        if is_supported_image_type(&media_type) || is_supported_document_type(&media_type) {
+            tracing::debug!("[ImageConverter] URL media type: {}", media_type);
+        }
         // Return as-is, the API might support URL references
         return Some(ContentBlock::ImageUrl {
             image_url: image_url.clone(),
@@ -225,7 +244,8 @@ pub fn bytes_to_image_source(bytes: &[u8], media_type: &str) -> ImageSource {
 ///
 /// This function processes a vector of content blocks and:
 /// - Converts ImageUrl blocks to native Image format where possible
-/// - Extracts Document blocks as images
+/// - Converts Document blocks to Image format where applicable
+/// - Validates media types and base64 data
 /// - Returns the processed blocks
 ///
 /// # Arguments
@@ -247,10 +267,74 @@ pub fn process_image_blocks(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
                         ContentBlock::ImageUrl { image_url }
                     }
                 }
+                ContentBlock::Document { source, cache_control } => {
+                    // Check if document type is supported
+                    if let Some(ref media_type) = source.media_type {
+                        if !is_supported_document_type(media_type) {
+                            tracing::warn!(
+                                "[ImageConverter] Unsupported document type: {}",
+                                media_type
+                            );
+                        }
+                    }
+                    
+                    // Try to convert document to image source for compatible types
+                    if let Some(image_source) = document_to_image_source(&source) {
+                        if is_supported_image_type(&image_source.media_type) {
+                            tracing::debug!(
+                                "[ImageConverter] Converting document to image: {}",
+                                image_source.media_type
+                            );
+                            return ContentBlock::Image {
+                                source: image_source,
+                                cache_control,
+                            };
+                        }
+                    }
+                    
+                    // Keep as document if can't convert
+                    ContentBlock::Document { source, cache_control }
+                }
+                ContentBlock::Image { ref source, .. } => {
+                    // Validate image data
+                    if !is_supported_image_type(&source.media_type) {
+                        tracing::warn!(
+                            "[ImageConverter] Unsupported image type: {}",
+                            source.media_type
+                        );
+                    }
+                    if !is_valid_base64(&source.data) {
+                        tracing::warn!("[ImageConverter] Invalid base64 data in image block");
+                    }
+                    block
+                }
                 other => other,
             }
         })
         .collect()
+}
+
+/// Process raw bytes upload and convert to content block
+///
+/// # Arguments
+/// * `bytes` - Raw image bytes
+/// * `media_type` - MIME type of the image
+/// * `validate` - Whether to validate the data
+///
+/// # Returns
+/// * `Option<ContentBlock>` - Image content block if successful
+pub fn bytes_to_content_block(bytes: &[u8], media_type: &str, validate: bool) -> Option<ContentBlock> {
+    if validate && !is_supported_image_type(media_type) && !is_supported_document_type(media_type) {
+        tracing::warn!("[ImageConverter] Unsupported media type for bytes: {}", media_type);
+        return None;
+    }
+    
+    let source = bytes_to_image_source(bytes, media_type);
+    
+    Some(ContentBlock::Image {
+        source,
+        cache_control: None,
+    })
 }
 
 #[cfg(test)]

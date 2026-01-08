@@ -3,7 +3,11 @@ use serde_json::{Value, json};
 use tiktoken_rs::o200k_base;
 
 use super::claude::{CreateMessageParams as ClaudeCreateMessageParams, *};
-use crate::format::{clean_json_schema, remap_tool_result_args};
+use crate::format::{
+    annotations_to_web_search_content, clean_json_schema, ensure_valid_schema,
+    move_constraints_to_description, oai_image_url_to_claude, remap_oai_to_claude_args,
+    remap_tool_result_args,
+};
 use crate::types::claude::Message;
 
 /// OpenAI-specific role that includes "tool" for tool results
@@ -37,18 +41,52 @@ pub enum Effort {
     High = 256 * 8 * 8,
 }
 
+/// OpenAI format message content
+/// OAI uses "content" directly at the top level, not nested like Claude
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum OaiMessageContent {
+    /// Simple text content (string)
+    Text(String),
+    /// Structured content blocks (array)
+    Blocks(Vec<ContentBlock>),
+    /// Null content (for assistant messages with only tool_calls)
+    Null,
+}
+
+impl Default for OaiMessageContent {
+    fn default() -> Self {
+        OaiMessageContent::Null
+    }
+}
+
+impl OaiMessageContent {
+    /// Convert to Claude MessageContent format
+    pub fn to_claude_format(self) -> MessageContent {
+        match self {
+            OaiMessageContent::Text(text) => MessageContent::Text { content: text },
+            OaiMessageContent::Blocks(blocks) => MessageContent::Blocks { content: blocks },
+            OaiMessageContent::Null => MessageContent::Text { content: String::new() },
+        }
+    }
+}
+
 /// OpenAI format message with tool support
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OaiMessage {
     pub role: OaiRole,
-    #[serde(flatten)]
-    pub content: MessageContent,
+    /// Content field - can be string, array, or null
+    #[serde(default)]
+    pub content: OaiMessageContent,
     /// Tool call ID for tool role messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Tool calls made by assistant
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OaiToolCall>>,
+    /// Annotations (web search citations) for content
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Vec<Value>>,
 }
 
 /// OpenAI tool call format
@@ -67,23 +105,117 @@ pub struct OaiToolCallFunction {
     pub arguments: String,
 }
 
+/// OpenAI tool definition format (for request tools field)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum OaiTool {
+    /// OpenAI function tool format
+    #[serde(rename = "function")]
+    Function { function: OaiToolFunction },
+    /// Claude custom tool format (passthrough)
+    #[serde(rename = "custom")]
+    Custom(CustomTool),
+    /// Other tool types (passthrough as raw)
+    #[serde(other)]
+    Other,
+}
+
+/// OpenAI function definition
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OaiToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+}
+
+impl From<OaiTool> for Tool {
+    fn from(oai_tool: OaiTool) -> Self {
+        match oai_tool {
+            OaiTool::Function { function } => {
+                // Check for special built-in tools
+                match function.name.as_str() {
+                    "web_search" => {
+                        // Convert to Claude's built-in web_search tool
+                        Tool::Known(KnownTool::WebSearch20250305 {
+                            name: ToolNameWebSearch::WebSearch,
+                            allowed_domains: None,
+                            blocked_domains: None,
+                            cache_control: None,
+                            max_uses: None,
+                            user_location: None,
+                            extra: std::collections::HashMap::new(),
+                        })
+                    }
+                    "bash" => {
+                        // Convert to Claude's built-in bash tool
+                        Tool::Known(KnownTool::Bash20250124 {
+                            name: ToolNameBash::Bash,
+                            cache_control: None,
+                            extra: std::collections::HashMap::new(),
+                        })
+                    }
+                    "str_replace_editor" => {
+                        // Convert to Claude's built-in text editor tool (older version)
+                        Tool::Known(KnownTool::TextEditor20250124 {
+                            name: ToolNameStrReplaceEditor::StrReplaceEditor,
+                            cache_control: None,
+                            extra: std::collections::HashMap::new(),
+                        })
+                    }
+                    "str_replace_based_edit_tool" => {
+                        // Convert to Claude's built-in text editor tool (newer version)
+                        Tool::Known(KnownTool::TextEditor20250728 {
+                            name: ToolNameStrReplaceBasedEditTool::StrReplaceBasedEditTool,
+                            cache_control: None,
+                            max_characters: None,
+                            extra: std::collections::HashMap::new(),
+                        })
+                    }
+                    _ => {
+                        // Regular function -> custom tool
+                        Tool::Custom(CustomTool {
+                            name: function.name,
+                            description: function.description,
+                            input_schema: function.parameters.unwrap_or(json!({"type": "object", "properties": {}})),
+                            cache_control: None,
+                            type_: Some(CustomToolType::Custom),
+                        })
+                    }
+                }
+            }
+            OaiTool::Custom(custom) => Tool::Custom(CustomTool {
+                type_: Some(CustomToolType::Custom),
+                ..custom
+            }),
+            OaiTool::Other => Tool::Raw(json!({})),
+        }
+    }
+}
+
 /// Convert OAI message to Claude message
 fn convert_oai_message(msg: OaiMessage) -> Message {
     match msg.role {
         OaiRole::Tool => {
             // Convert tool role to user message with tool_result block
             let tool_use_id = msg.tool_call_id.unwrap_or_default();
+            // Claude API requires tool_result.content to be a string or array of content blocks
+            // NOT a JSON object. Keep the content as a string.
             let content_value = match msg.content {
-                MessageContent::Text { content } => {
-                    // Try to parse as JSON, otherwise use as string
-                    serde_json::from_str(&content).unwrap_or(json!(content))
+                OaiMessageContent::Text(text) => {
+                    // Keep as string - Claude API doesn't accept objects for tool_result.content
+                    json!(text)
                 }
-                MessageContent::Blocks { content } => json!(content),
+                OaiMessageContent::Blocks(blocks) => json!(blocks),
+                OaiMessageContent::Null => json!(""),
             };
             
-            // Apply reverse parameter remapping
+            // Apply reverse parameter remapping (only if content is an object)
             let mut remapped_content = content_value.clone();
-            remap_tool_result_args(&tool_use_id, &mut remapped_content);
+            if remapped_content.is_object() {
+                remap_tool_result_args(&tool_use_id, &mut remapped_content);
+            }
             
             Message {
                 role: Role::User,
@@ -104,13 +236,13 @@ fn convert_oai_message(msg: OaiMessage) -> Message {
             
             // Add text content if present
             match msg.content {
-                MessageContent::Text { content } if !content.is_empty() => {
+                OaiMessageContent::Text(text) if !text.is_empty() => {
                     blocks.push(ContentBlock::Text {
-                        text: content,
+                        text,
                         cache_control: None,
                     });
                 }
-                MessageContent::Blocks { content } => {
+                OaiMessageContent::Blocks(content) => {
                     blocks.extend(content);
                 }
                 _ => {}
@@ -118,8 +250,10 @@ fn convert_oai_message(msg: OaiMessage) -> Message {
             
             // Add tool_use blocks
             for tc in tool_calls {
-                let input: Value = serde_json::from_str(&tc.function.arguments)
+                let mut input: Value = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(json!({}));
+                // Apply OAI → Claude parameter remapping
+                remap_oai_to_claude_args(&tc.function.name, &mut input);
                 blocks.push(ContentBlock::ToolUse {
                     id: tc.id,
                     name: tc.function.name,
@@ -135,10 +269,65 @@ fn convert_oai_message(msg: OaiMessage) -> Message {
             }
         }
         _ => {
-            // Standard message conversion
+            // Standard message conversion - with image format conversion
+            let mut blocks: Vec<ContentBlock> = Vec::new();
+            
+            // First, convert message content
+            match msg.content {
+                OaiMessageContent::Blocks(content) => {
+                    // Convert ImageUrl blocks to native Image format
+                    let converted: Vec<ContentBlock> = content
+                        .into_iter()
+                        .map(|block| {
+                            if let ContentBlock::ImageUrl { ref image_url } = block {
+                                oai_image_url_to_claude(image_url).unwrap_or(block)
+                            } else {
+                                block
+                            }
+                        })
+                        .collect();
+                    blocks.extend(converted);
+                }
+                OaiMessageContent::Text(text) => {
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Text {
+                            text,
+                            cache_control: None,
+                        });
+                    }
+                }
+                OaiMessageContent::Null => {}
+            };
+            
+            // Handle annotations (web search citations) -> convert to Claude web_search format
+            if let Some(annotations) = msg.annotations {
+                if !annotations.is_empty() {
+                    let web_search_content = annotations_to_web_search_content(&annotations);
+                    if !web_search_content.is_empty() {
+                        tracing::debug!(
+                            "[OAI→Claude] Converting {} annotations to web search content",
+                            annotations.len()
+                        );
+                        // Add as tool result with web search content
+                        blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: "web_search".to_string(),
+                            content: json!(web_search_content),
+                            is_error: None,
+                            cache_control: None,
+                        });
+                    }
+                }
+            }
+            
+            let content = if blocks.is_empty() {
+                MessageContent::Text { content: String::new() }
+            } else {
+                MessageContent::Blocks { content: blocks }
+            };
+            
             Message {
                 role: msg.role.into(),
-                content: msg.content,
+                content,
             }
         }
     }
@@ -165,18 +354,35 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             .collect::<Vec<_>>();
         let system = (!systems.is_empty()).then(|| json!(systems));
         
-        // Clean tool schemas if present
+        // Convert OAI tools to Claude tools and clean schemas
         let tools = params.tools.map(|tools| {
-            tools.into_iter().map(|tool| {
+            tools.into_iter().filter_map(|oai_tool| {
+                let tool: Tool = oai_tool.into();
                 match tool {
                     Tool::Custom(mut custom) => {
+                        // Full schema cleaning pipeline:
+                        // 1. Move constraints to description (before removing them)
+                        move_constraints_to_description(&mut custom.input_schema);
+                        // 2. Clean unsupported keywords
                         clean_json_schema(&mut custom.input_schema);
-                        Tool::Custom(custom)
+                        // 3. Ensure schema is valid
+                        ensure_valid_schema(&mut custom.input_schema);
+                        // Ensure type is set to custom for Claude Code API
+                        custom.type_ = Some(CustomToolType::Custom);
+                        Some(Tool::Custom(custom))
                     }
-                    other => other,
+                    Tool::Raw(v) if v.as_object().map(|o| o.is_empty()).unwrap_or(true) => {
+                        // Filter out empty tools from OaiTool::Other
+                        None
+                    }
+                    other => Some(other),
                 }
             }).collect()
         });
+        
+        // Convert tool_choice from Simple to Object format for Claude Code API compatibility
+        // Claude Code API requires object format: {"type": "auto"} instead of "auto"
+        let tool_choice = params.tool_choice.map(|tc| tc.to_object_format());
         
         Self {
             max_tokens: (params.max_tokens.or(params.max_completion_tokens))
@@ -193,7 +399,7 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             top_k: params.top_k,
             top_p: params.top_p,
             tools,
-            tool_choice: params.tool_choice,
+            tool_choice,
             metadata: params.metadata,
             n: params.n,
         }
@@ -238,9 +444,9 @@ pub struct CreateMessageParams {
     /// Logit bias for token generation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<Value>,
-    /// Tools that the model may use
+    /// Tools that the model may use (supports both OAI function and Claude custom formats)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<OaiTool>>,
     /// How the model should use tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
@@ -308,9 +514,9 @@ pub struct OaiCreateMessageParams {
     /// Top-p sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// Tools that the model may use
+    /// Tools that the model may use (OAI function format)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<OaiTool>>,
     /// How the model should use tools
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
@@ -350,15 +556,25 @@ impl From<OaiCreateMessageParams> for ClaudeCreateMessageParams {
             .collect::<Vec<_>>();
         let system = (!systems.is_empty()).then(|| json!(systems));
         
-        // Clean tool schemas if present
+        // Convert OAI tools to Claude tools and clean schemas
         let tools = params.tools.map(|tools| {
-            tools.into_iter().map(|tool| {
+            tools.into_iter().filter_map(|oai_tool| {
+                let tool: Tool = oai_tool.into();
                 match tool {
                     Tool::Custom(mut custom) => {
+                        // Apply full schema cleaning pipeline
+                        move_constraints_to_description(&mut custom.input_schema);
                         clean_json_schema(&mut custom.input_schema);
-                        Tool::Custom(custom)
+                        ensure_valid_schema(&mut custom.input_schema);
+                        // Ensure type is set to custom for Claude Code API
+                        custom.type_ = Some(CustomToolType::Custom);
+                        Some(Tool::Custom(custom))
                     }
-                    other => other,
+                    Tool::Raw(v) if v.as_object().map(|o| o.is_empty()).unwrap_or(true) => {
+                        // Filter out empty tools from OaiTool::Other
+                        None
+                    }
+                    other => Some(other),
                 }
             }).collect()
         });
@@ -378,7 +594,7 @@ impl From<OaiCreateMessageParams> for ClaudeCreateMessageParams {
             top_k: params.top_k,
             top_p: params.top_p,
             tools,
-            tool_choice: params.tool_choice,
+            tool_choice: params.tool_choice.map(|tc| tc.to_object_format()),
             metadata: params.metadata,
             n: params.n,
         }

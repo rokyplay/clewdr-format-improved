@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::format::{
-    extract_citations_from_search_result, extract_citations_from_tool_result,
+    claude_image_to_oai, extract_citations_from_search_result, extract_citations_from_tool_result,
     citations_to_annotations, merge_citations_into_text,
     remap_function_call_args, store_thought_signature, Citation,
 };
@@ -335,6 +335,15 @@ pub fn transforms_json(input: CreateMessageResponse) -> Value {
                 // Extract citations from search results
                 let citations = extract_citations_from_search_result(data);
                 all_citations.extend(citations);
+            }
+            ContentBlock::Image { source, .. } => {
+                // Convert Claude image to OpenAI format (data URI)
+                // Note: OpenAI doesn't have a direct image content type in responses,
+                // but we can include it as a data URI in content if needed
+                let converted = claude_image_to_oai(source);
+                if let ContentBlock::ImageUrl { image_url } = converted {
+                    content_parts.push(format!("![image]({})", image_url.url));
+                }
             }
             _ => {}
         }

@@ -77,7 +77,7 @@ impl CreateMessageParams {
                 MessageContent::Blocks { ref content } => content
                     .iter()
                     .map(|block| match block {
-                        ContentBlock::Text { text } => text,
+                        ContentBlock::Text { text, .. } => text,
                         _ => "",
                     })
                     .collect::<String>(),
@@ -356,7 +356,7 @@ pub struct ImageUrl {
 }
 
 /// Cache control breakpoint configuration.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct CacheControlEphemeral {
     #[serde(rename = "type")]
     pub type_: CacheControlType,
@@ -517,6 +517,28 @@ pub enum ToolChoice {
     Simple(ToolChoiceSimple),
     /// Object format with type tag
     Object(ToolChoiceObject),
+}
+
+impl ToolChoice {
+    /// Convert Simple format to Object format for Claude Code API compatibility
+    /// Claude Code API requires object format: {"type": "auto"} instead of "auto"
+    pub fn to_object_format(self) -> Self {
+        match self {
+            ToolChoice::Simple(simple) => {
+                let obj = match simple {
+                    ToolChoiceSimple::Auto => ToolChoiceObject::Auto {
+                        disable_parallel_tool_use: None,
+                    },
+                    ToolChoiceSimple::Any => ToolChoiceObject::Any {
+                        disable_parallel_tool_use: None,
+                    },
+                    ToolChoiceSimple::None => ToolChoiceObject::None,
+                };
+                ToolChoice::Object(obj)
+            }
+            obj @ ToolChoice::Object(_) => obj,
+        }
+    }
 }
 
 /// Simple string tool choice values

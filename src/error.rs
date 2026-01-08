@@ -103,6 +103,10 @@ pub enum ClewdrError {
     ZipError { source: zip::result::ZipError },
     #[snafu(display("Asset Error: {}", msg))]
     AssetError { msg: String },
+    #[snafu(display("Internal error: {}", msg))]
+    InternalError { msg: String },
+    #[snafu(display("Deserialize error: {}", msg))]
+    DeserializeError { msg: String },
     #[snafu(display("Invalid version: {}", version))]
     InvalidVersion { version: String },
     #[snafu(display("ParseInt error: {}", source))]

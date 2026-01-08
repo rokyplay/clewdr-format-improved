@@ -41,7 +41,7 @@ pub use web_search::{
 
 // Image converter exports
 pub use image_converter::{
-    bytes_to_image_source, claude_image_to_oai, document_to_image_source,
+    bytes_to_content_block, bytes_to_image_source, claude_image_to_oai, document_to_image_source,
     extract_image_from_data_uri, infer_media_type_from_url, is_supported_document_type,
     is_supported_image_type, is_valid_base64, oai_image_url_to_claude, process_image_blocks,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_TYPES,

@@ -15,12 +15,18 @@ use serde_json::{Value, json};
 use crate::{
     config::CLEWDR_CONFIG,
     error::ClewdrError,
+    format::{
+        analyze_conversation_state, clean_cache_control_from_messages, clear_thought_signature,
+        extract_signatures, get_thought_signature, has_valid_signature_for_function_calls,
+        message_has_tool_result, needs_thinking_recovery, process_image_blocks,
+        should_disable_thinking_due_to_history, strip_invalid_thinking_blocks,
+    },
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     types::{
         claude::{
             ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
         },
-        oai::CreateMessageParams as OaiCreateMessageParams,
+        oai::OaiCreateMessageParams,
     },
 };
 
@@ -67,6 +73,7 @@ static TEST_MESSAGE_CLAUDE: LazyLock<Message> = LazyLock::new(|| {
         Role::User,
         vec![ContentBlock::Text {
             text: "Hi".to_string(),
+            cache_control: None,
         }],
     )
 });
@@ -92,12 +99,12 @@ fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
                     let mut new_blocks: Vec<ContentBlock> = content
                         .into_iter()
                         .filter_map(|b| match b {
-                            ContentBlock::Text { text } => {
+                            ContentBlock::Text { text, .. } => {
                                 let t = text.trim().to_string();
                                 if t.is_empty() {
                                     None
                                 } else {
-                                    Some(ContentBlock::Text { text: t })
+                                    Some(ContentBlock::Text { text: t, cache_control: None })
                                 }
                             }
                             other => Some(other),
@@ -129,19 +136,112 @@ where
         } else {
             ClaudeApiFormat::Claude
         };
+        
+        // Extract raw bytes first for debugging
+        let bytes = axum::body::Bytes::from_request(req, &()).await
+            .map_err(|e| ClewdrError::InternalError { msg: format!("Failed to read body: {e}") })?;
+        
+        // Parse JSON based on format
         let Json(mut body) = match format {
             ClaudeApiFormat::OpenAI => {
-                let Json(json) = Json::<OaiCreateMessageParams>::from_request(req, &()).await?;
-                Json(json.into())
+                match serde_json::from_slice::<OaiCreateMessageParams>(&bytes) {
+                    Ok(json) => Json(json.into()),
+                    Err(e) => {
+                        // Save raw request for debugging
+                        let debug_path = "log/debug_raw_request.json";
+                        if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let _ = std::fs::write(debug_path, serde_json::to_string_pretty(&json_value).unwrap_or_default());
+                            tracing::error!("[DEBUG] Saved raw request to {} - Error: {}", debug_path, e);
+                        } else {
+                            let _ = std::fs::write(debug_path, &bytes);
+                            tracing::error!("[DEBUG] Saved raw bytes to {} - Parse error: {}", debug_path, e);
+                        }
+                        return Err(ClewdrError::DeserializeError { msg: format!("Failed to deserialize the JSON body into the target type: {e}") });
+                    }
+                }
             }
-            ClaudeApiFormat::Claude => Json::<CreateMessageParams>::from_request(req, &()).await?,
+            ClaudeApiFormat::Claude => {
+                match serde_json::from_slice::<CreateMessageParams>(&bytes) {
+                    Ok(json) => Json(json),
+                    Err(e) => {
+                        let debug_path = "log/debug_raw_request.json";
+                        if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let _ = std::fs::write(debug_path, serde_json::to_string_pretty(&json_value).unwrap_or_default());
+                            tracing::error!("[DEBUG] Saved raw request to {} - Error: {}", debug_path, e);
+                        } else {
+                            let _ = std::fs::write(debug_path, &bytes);
+                            tracing::error!("[DEBUG] Saved raw bytes to {} - Parse error: {}", debug_path, e);
+                        }
+                        return Err(ClewdrError::DeserializeError { msg: format!("Failed to deserialize the JSON body into the target type: {e}") });
+                    }
+                }
+            }
         };
         // Sanitize messages: trim whitespace and drop whitespace-only assistant turns
         body.messages = sanitize_messages(body.messages);
+        
+        // Process image_url blocks in messages (OpenAI -> Claude conversion)
+        body.messages = body
+            .messages
+            .into_iter()
+            .map(|mut msg| {
+                if let MessageContent::Blocks { content } = msg.content {
+                    // Use process_image_blocks for conversion
+                    msg.content = MessageContent::Blocks {
+                        content: process_image_blocks(content),
+                    };
+                }
+                msg
+            })
+            .collect();
+        
+        // Clean cache_control from historical messages (prevents API errors)
+        clean_cache_control_from_messages(&mut body.messages);
+        
+        // Handle thinking mode
         if body.model.ends_with("-thinking") {
             body.model = body.model.trim_end_matches("-thinking").to_string();
             body.thinking.get_or_insert(Thinking::new(4096));
         }
+        
+        // Check if thinking should be disabled due to conversation history
+        if body.thinking.is_some() && should_disable_thinking_due_to_history(&body.messages) {
+            tracing::info!("[Format] Disabling thinking mode due to incompatible history");
+            body.thinking = None;
+        }
+        
+        // Strip invalid thinking blocks from history
+        strip_invalid_thinking_blocks(&mut body.messages);
+        
+        // Analyze conversation state
+        let state = analyze_conversation_state(&body.messages);
+        if state.in_tool_loop {
+            tracing::debug!("[Format] In tool loop with {} results", state.tool_result_count);
+        }
+        
+        // Log tool result status for debugging
+        if let Some(last_user) = body.messages.iter().rev().find(|m| m.role == Role::User) {
+            if message_has_tool_result(last_user) {
+                tracing::debug!("[Format] Last user message contains tool result");
+            }
+        }
+        
+        // Extract and log all signatures for debugging
+        let signatures = extract_signatures(&body.messages);
+        if !signatures.is_empty() {
+            tracing::debug!("[Format] Found {} signatures in history", signatures.len());
+        }
+        
+        // Check if thinking recovery is needed
+        if body.thinking.is_some() && needs_thinking_recovery(&body.messages) {
+            let global_sig = get_thought_signature();
+            if has_valid_signature_for_function_calls(&body.messages, &global_sig) {
+                tracing::debug!("[Format] Valid signature available for thinking recovery");
+            } else {
+                tracing::warn!("[Format] Thinking recovery needed but no valid signature found");
+            }
+        }
+        
         Ok(Self(body, format))
     }
 }
@@ -242,11 +342,13 @@ where
                     .custom_system
                     .clone()
                     .unwrap_or_else(|| PRELUDE_TEXT.to_string()),
+                cache_control: None,
             };
             match body.system {
                 Some(Value::String(ref text)) => {
                     let text_content = ContentBlock::Text {
                         text: text.to_owned(),
+                        cache_control: None,
                     };
                     body.system = Some(json!([prelude_blk, text_content]));
                 }
