@@ -98,10 +98,25 @@ Cursor:
 
 ## Resources
 
-- Wiki: <https://github.com/Xerxes-2/clewdr/wiki>  
+- Wiki: <https://github.com/Xerxes-2/clewdr/wiki>
+
+## Fork Enhancements
+
+This fork adds enhanced format conversion for better Claude Code and OpenAI compatibility:
+
+- **OAI tool role support** - Full support for OpenAI's `role: "tool"` messages
+- **Image format conversion** - Automatic conversion between data URI and Claude native formats
+- **Web Search support** - Claude web search results converted to OpenAI annotations format
+- **Schema cleaning** - JSON Schema sanitization for cross-provider compatibility
+- **Thinking mode utilities** - Signature storage and conversation state analysis
+- **Parameter remapping** - Automatic tool parameter name conversion (e.g., `query` → `pattern`)
+
+All features tested with Claude Code (Write/Read/Glob/Bash/WebSearch).
 
 ## Thanks
 
-- [wreq](https://github.com/0x676e67/wreq) for the fingerprinting library.  
-- [Clewd](https://github.com/teralomaniac/clewd) for many upstream ideas.  
+- [wreq](https://github.com/0x676e67/wreq) for the fingerprinting library.
+- [Clewd](https://github.com/teralomaniac/clewd) for many upstream ideas.
 - [Clove](https://github.com/mirrorange/clove) for Claude Code helpers.
+- [antigravity-claude-proxy](https://github.com/badri-s/antigravity-claude-proxy) for format conversion patterns.
+- [claude-code-router](https://github.com/musistudio/claude-code-router) for schema cleaning and web search formatting.
