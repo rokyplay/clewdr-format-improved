@@ -30,11 +30,10 @@ Streaming responses work on every endpoint.
 
 ## Quick Start
 
-1. Download the latest release for your platform from GitHub.  
-   Linux/macOS example:
+1. Download the latest release for your platform from GitHub.
+   Linux/macOS example (this fork):
    ```bash
-   curl -L -o clewdr.tar.gz https://github.com/Xerxes-2/clewdr/releases/latest/download/clewdr-linux-x64.tar.gz
-   tar -xzf clewdr.tar.gz && cd clewdr-linux-x64
+   curl -L -o clewdr https://github.com/rokyplay/clewdr-format-improved/releases/download/v0.12.2-format-improved/clewdr-linux-x64
    chmod +x clewdr
    ```
 2. Run the binary:
