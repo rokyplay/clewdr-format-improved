@@ -365,8 +365,10 @@ where
 
         // Add Claude Code prelude if not already present
         // This is required for Claude Code API to work correctly
+        // NOTE: The system prompt MUST contain "Claude Code, Anthropic's official CLI for Claude"
+        // for the OAuth token to be accepted by Anthropic API
         if !has_claude_code_system {
-            const PRELUDE_TEXT: &str = "You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Do what has been asked; nothing more, nothing less. When you complete the task simply respond with a detailed writeup.";
+            const PRELUDE_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
             let prelude_blk = ContentBlock::Text {
                 text: CLEWDR_CONFIG
                     .load()
