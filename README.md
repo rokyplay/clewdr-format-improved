@@ -117,5 +117,5 @@ All features tested with Claude Code (Write/Read/Glob/Bash/WebSearch).
 - [wreq](https://github.com/0x676e67/wreq) for the fingerprinting library.
 - [Clewd](https://github.com/teralomaniac/clewd) for many upstream ideas.
 - [Clove](https://github.com/mirrorange/clove) for Claude Code helpers.
-- [antigravity-claude-proxy](https://github.com/badri-s/antigravity-claude-proxy) for format conversion patterns.
+- [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) for format conversion patterns.
 - [claude-code-router](https://github.com/musistudio/claude-code-router) for schema cleaning and web search formatting.
