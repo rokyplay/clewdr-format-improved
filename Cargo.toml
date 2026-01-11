@@ -1,8 +1,8 @@
 [package]
 name = "clewdr"
-version = "0.12.4"
+version = "0.12.7"
 edition = "2024"
-authors = ["Xerxes-2 <dspxue@gmail.com>", "LeenHawk <leenhawk@leenhawk.com>"]
+authors = ["rokyplay <noreply@github.com>"]
 license = "AGPL-3.0"
 
 [lib]

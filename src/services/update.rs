@@ -53,7 +53,7 @@ impl ClewdrUpdater {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("Xerxes-2");
-        let repo_name = env!("CARGO_PKG_NAME");
+        let repo_name = "clewdr-format-improved";
         let policy = wreq::redirect::Policy::default();
         let client = wreq::Client::builder()
             .redirect(policy)
