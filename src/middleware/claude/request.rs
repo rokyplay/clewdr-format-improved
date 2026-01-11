@@ -332,9 +332,22 @@ where
         // Determine streaming status and API format
         let stream = body.stream.unwrap_or_default();
 
-        // If the request is not from Claude Code, add a prelude to the system messages
-        if !is_from_cc {
-            // Add a prelude text block to the system messages
+        // Check if system prompt already contains Claude Code identifier
+        // The official Claude Code system prompt contains: "You are an agent for Claude Code"
+        let has_claude_code_system = match &body.system {
+            Some(Value::String(s)) => s.contains("Claude Code"),
+            Some(Value::Array(arr)) => arr.iter().any(|v| {
+                v.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.contains("Claude Code"))
+                    .unwrap_or(false)
+            }),
+            _ => false,
+        };
+        
+        // Add Claude Code prelude if not already present
+        // This is required for Claude Code API to work correctly
+        if !has_claude_code_system {
             const PRELUDE_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
             let prelude_blk = ContentBlock::Text {
                 text: CLEWDR_CONFIG
