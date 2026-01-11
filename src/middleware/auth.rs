@@ -67,7 +67,8 @@ where
 
 /// Middleware guard that ensures requests have valid OpenAI API authentication
 ///
-/// This extractor validates the Bearer token against the configured OpenAI API keys.
+/// This extractor validates either the Bearer token or X-API-Key header against the configured API keys.
+/// It supports both OpenAI-style (Bearer) and Claude-style (x-api-key) authentication.
 /// It's used to protect OpenAI-compatible API endpoints.
 ///
 /// # Example
@@ -91,21 +92,34 @@ where
         parts: &mut axum::http::request::Parts,
         _: &S,
     ) -> Result<Self, Self::Rejection> {
-        let AuthBearer(key) = AuthBearer::from_request_parts(parts, &())
-            .await
-            .map_err(|_| ClewdrError::InvalidAuth)?;
-        if !CLEWDR_CONFIG.load().user_auth(&key) {
+        // Try Bearer token first
+        if let Ok(AuthBearer(key)) = AuthBearer::from_request_parts(parts, &()).await {
+            if CLEWDR_CONFIG.load().user_auth(&key) {
+                return Ok(Self);
+            }
             warn!("Invalid Bearer key: {}", key);
             return Err(ClewdrError::InvalidAuth);
         }
-        Ok(Self)
+        
+        // Fall back to X-API-Key (for flexibility)
+        if let Ok(XApiKey(key)) = XApiKey::from_request_parts(parts, &()).await {
+            if CLEWDR_CONFIG.load().user_auth(&key) {
+                return Ok(Self);
+            }
+            warn!("Invalid x-api-key: {}", key);
+            return Err(ClewdrError::InvalidAuth);
+        }
+        
+        // Neither auth method provided
+        Err(ClewdrError::InvalidAuth)
     }
 }
 
 /// Middleware guard that ensures requests have valid Claude API authentication
 ///
-/// This extractor validates the X-API-Key header against the configured API keys.
-/// It's used to protect Claude-compatible API endpoints.
+/// This extractor validates either the X-API-Key header or Bearer token against the configured API keys.
+/// It supports both Claude-style (x-api-key) and OpenAI-style (Bearer) authentication.
+/// This is required because Claude Code CLI uses Bearer token but sends to /v1/messages endpoint.
 pub struct RequireXApiKeyAuth;
 impl<S> FromRequestParts<S> for RequireXApiKeyAuth
 where
@@ -116,11 +130,25 @@ where
         parts: &mut axum::http::request::Parts,
         _: &S,
     ) -> Result<Self, Self::Rejection> {
-        let XApiKey(key) = XApiKey::from_request_parts(parts, &()).await?;
-        if !CLEWDR_CONFIG.load().user_auth(&key) {
+        // Try X-API-Key first
+        if let Ok(XApiKey(key)) = XApiKey::from_request_parts(parts, &()).await {
+            if CLEWDR_CONFIG.load().user_auth(&key) {
+                return Ok(Self);
+            }
             warn!("Invalid x-api-key: {}", key);
             return Err(ClewdrError::InvalidAuth);
         }
-        Ok(Self)
+        
+        // Fall back to Bearer token (for Claude Code CLI compatibility)
+        if let Ok(AuthBearer(key)) = AuthBearer::from_request_parts(parts, &()).await {
+            if CLEWDR_CONFIG.load().user_auth(&key) {
+                return Ok(Self);
+            }
+            warn!("Invalid Bearer key: {}", key);
+            return Err(ClewdrError::InvalidAuth);
+        }
+        
+        // Neither auth method provided
+        Err(ClewdrError::InvalidAuth)
     }
 }
