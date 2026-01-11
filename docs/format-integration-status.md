@@ -1,12 +1,12 @@
 # clewdr format 模块集成状态报告
 
-## 日期: 2026-01-09
+## 日期: 2026-01-11
 
 ## GitHub 仓库
 
 - **Fork 仓库**: https://github.com/rokyplay/clewdr-format-improved
-- **Release**: v0.12.2-format-improved
-- **下载**: https://github.com/rokyplay/clewdr-format-improved/releases/download/v0.12.2-format-improved/clewdr-linux-x64
+- **Release**: v0.12.5-format-improved (待发布)
+- **下载**: https://github.com/rokyplay/clewdr-format-improved/releases
 
 ### 编译说明
 
@@ -16,149 +16,247 @@ cd frontend && pnpm install && pnpm build
 cargo build --release --no-default-features --features "portable,embed-resource"
 ```
 
-## 当前问题状态 ✅ FIXED
+---
 
-### 核心问题
-OAI `role: "tool"` 消息解析失败，错误信息：
-```
-unknown variant `tool`, expected one of `system`, `user`, `assistant`
-```
+## 开发环境配置
 
-### 根本原因 🔍
+### 服务器角色
 
-**导入错误！** `request.rs` 中导入了错误的类型：
-
-```rust
-// 错误的导入 (request.rs:29)
-use crate::types::oai::CreateMessageParams as OaiCreateMessageParams;
-
-// 正确的导入
-use crate::types::oai::OaiCreateMessageParams;
-```
-
-**问题分析**：
-- `oai.rs` 中有两个结构体：
-  1. `CreateMessageParams` (363行) - 用 `Vec<Message>` (Claude 类型，**不支持 tool role**)
-  2. `OaiCreateMessageParams` (439行) - 用 `Vec<OaiMessage>` (OAI 类型，**支持 tool role**)
-- 原代码导入了 `CreateMessageParams` 并重命名为 `OaiCreateMessageParams`
-- 这导致解析时使用了 Claude 的 `Message` 类型，其 `role` 字段是 `Role` 枚举（只有 system/user/assistant）
-
-### 排查过程
-
-1. **错误信息分析**：`unknown variant 'tool', expected one of 'system', 'user', 'assistant'`
-   - 这说明解析器使用的是 Claude 的 `Role` 枚举，而不是 `OaiRole`
-
-2. **检查 OaiRole 定义**：确认 `OaiRole` 已包含 `Tool` 变体 ✅
-
-3. **检查 OaiMessage 定义**：确认使用 `pub role: OaiRole` ✅
-
-4. **检查 OaiCreateMessageParams 定义**：确认使用 `pub messages: Vec<OaiMessage>` ✅
-
-5. **检查 request.rs 导入**：发现问题！
-   ```rust
-   // 第 29 行
-   oai::CreateMessageParams as OaiCreateMessageParams  // ← 错误！
-   ```
-   
-6. **检查 oai.rs 中的结构体**：
-   - `CreateMessageParams` (363行): `pub messages: Vec<Message>` ← Claude 类型
-   - `OaiCreateMessageParams` (439行): `pub messages: Vec<OaiMessage>` ← OAI 类型
-
-### 修复方案
-
-修改 `src/middleware/claude/request.rs` 第 29 行：
-```rust
-// Before
-oai::CreateMessageParams as OaiCreateMessageParams,
-
-// After
-oai::OaiCreateMessageParams,
-```
-
-### 已完成的修复
-
-1. **OaiRole 枚举** - ✅ 已添加 `Tool` 变体
-2. **OaiMessageContent 枚举** - ✅ 新增支持 String/Array/Null
-3. **OaiMessage 结构体** - ✅ 更新使用新的 content 类型
-4. **tool_choice 格式转换** - ✅ 已实现 `to_object_format()` 方法
-5. **convert_oai_message 函数** - ✅ 已更新
-6. **request.rs 导入修复** - ✅ 已修复
-7. **OaiCreateMessageParams.tools 类型** - ✅ 改为 `Vec<OaiTool>`
-8. **OaiCreateMessageParams.tool_choice 转换** - ✅ 添加 `.map(|tc| tc.to_object_format())`
-9. **tool_result.content 格式** - ✅ 保持字符串格式，不解析为 JSON 对象
-10. **web_search 工具转换** - ✅ 转换为 Claude 内置 `KnownTool::WebSearch20250305`
-
-### 2026-01-08 测试结果
-
-| 功能 | 状态 | 备注 |
-|------|------|------|
-| Write (写入文件) | ✅ 成功 | |
-| Read (读取文件) | ✅ 成功 | |
-| Glob (文件搜索) | ✅ 成功 | |
-| Bash (执行命令) | ✅ 成功 | |
-| 图片识别 | ✅ 成功 | |
-| WebSearch (网络搜索) | ✅ 成功 | 2026-01-08 验证通过 |
-| 根路径前端界面 | ✅ 成功 | 需使用 embed-resource 编译 |
-
-### 调试文件
-- **原始请求**: `versions/format-improved/log/debug_raw_request.json`
-- **日志**: `versions/format-improved/log/clewdr.log.2026-01-07`
+| 服务器 | 内存 | 用途 | 说明 |
+|--------|------|------|------|
+| **8G 服务器** | 8GB | 开发/编译 | 用于 Rust 编译和代码修改 |
+| **2G 服务器** | 2GB | 部署/测试 | 运行 clewdr 收集日志 |
+| **本地** | - | 开发环境 | VSCode + RooCode 测试 |
 
 ### 部署信息
+
 - **服务路径**: `/root/clauder/versions/format-improved/`
 - **端口**: 8484
 - **密码**: `dyuY97Ym3uX2MnaFFN28WZvWWQNmU8ay8byU2aaQFZNfdhP3p4Y9gEGFzduqtxG7`
 - **Screen 会话**: `clewdr`
+- **外部访问**: `https://clewdr-gg1.204023.xyz`
+
+### 开发流程
+
+```
+1. 在 8G 服务器修改代码
+2. git push 到 GitHub
+3. 在 2G 服务器 git pull 并运行
+4. 收集日志分析问题
+```
 
 ---
 
-## 一、模块概览
+## 当前问题状态 ❌ 进行中
 
-`src/format/` 模块包含以下子模块：
+### 问题描述
+
+1. **RooCode 400 错误**:
+   ```
+   This credential is only authorized for use with Claude Code and cannot be used for other API requests.
+   ```
+
+2. **官方 Claude Code CLI 401 错误**: 认证失败
+
+### 请求链路分析
+
+#### RooCode 链路
+```
+RooCode → NewAPI → https://clewdr-gg1.204023.xyz/code/v1/chat/completions
+```
+
+| 步骤 | 组件 | 路径 |
+|------|------|------|
+| 1 | RooCode | 发送 OpenAI 格式请求 |
+| 2 | NewAPI | 基础URL: `https://clewdr-gg1.204023.xyz/code` |
+| 3 | clewdr | 接收: `/code/v1/chat/completions` |
+
+**clewdr 路由映射**:
+- `/code/v1/chat/completions` → `api_claude_code` (ClaudeCodeProvider)
+- 认证: `RequireBearerAuth`
+- 格式转换: OAI → Claude
+
+#### 官方 Claude Code CLI 链路
+```
+claude CLI → ANTHROPIC_BASE_URL → ???
+```
+
+**待确认**:
+- 官方 CLI 实际请求的路径是什么？
+- 是 `/v1/messages` 还是其他路径？
+
+### 错误来源分析
+
+**关键发现**: 错误信息 `This credential is only authorized for use with Claude Code` **不是 clewdr 返回的**！
+
+- clewdr 的认证错误是: `Key/Password Invalid`
+- 这个错误来自 **Anthropic 官方 API**
+
+**结论**: 请求透传到了 Anthropic，但 Anthropic 检测到请求不符合 Claude Code 规范。
+
+### 可能原因
+
+1. **System Prompt 缺失或不正确**: Anthropic 检测 system prompt 内容
+2. **Headers 缺失**: 缺少必要的 Claude Code 标识头
+3. **OAuth Token 问题**: Token 交换过程出错
+
+---
+
+## v0.12.5 修复内容
+
+### 1. 添加详细日志功能
+
+**修改文件**:
+- `src/middleware/claude/request.rs`
+- `src/claude_code_state/chat.rs`
+
+**日志文件位置** (`log/` 目录):
+| 文件 | 内容 |
+|------|------|
+| `claude_code_incoming_request.json` | 客户端发来的原始请求 |
+| `claude_code_processed_request.json` | 注入 system prompt 后的请求 |
+| `claude_code_outgoing_request.json` | 发送给 Anthropic 的最终请求 |
+
+**日志标签**:
+- `[CLAUDE_CODE_PREPROCESS]` - 请求预处理阶段
+- `[CLAUDE_CODE]` - 发送请求阶段
+
+### 2. System Prompt 注入逻辑
+
+检测逻辑:
+```rust
+// 检查 system prompt 是否已包含 "Claude Code"
+let has_claude_code_system = match &body.system {
+    Some(Value::String(s)) => s.contains("Claude Code"),
+    Some(Value::Array(arr)) => arr.iter().any(|v| {
+        v.get("text")
+            .and_then(|t| t.as_str())
+            .map(|s| s.contains("Claude Code"))
+            .unwrap_or(false)
+    }),
+    _ => false,
+};
+```
+
+注入内容:
+```
+You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Do what has been asked; nothing more, nothing less. When you complete the task simply respond with a detailed writeup.
+```
+
+---
+
+## 路由配置参考
+
+| 路径 | Handler | Provider | 认证 | 用途 |
+|------|---------|----------|------|------|
+| `/v1/messages` | `api_claude_web` | ClaudeWebProvider | X-API-Key | Claude Web (Cookie) |
+| `/code/v1/messages` | `api_claude_code` | ClaudeCodeProvider | X-API-Key | Claude Code (OAuth) |
+| `/v1/chat/completions` | `api_claude_web` | ClaudeWebProvider | Bearer | OpenAI 兼容 Web |
+| `/code/v1/chat/completions` | `api_claude_code` | ClaudeCodeProvider | Bearer | OpenAI 兼容 Code |
+
+---
+
+## 调试步骤
+
+### 1. 部署新版本
+```bash
+# 在 2G 服务器
+cd /root/clauder/versions/format-improved
+git pull
+# 重新编译或下载新的二进制
+./clewdr
+```
+
+### 2. 发送测试请求
+```bash
+# 从 RooCode 或 Claude Code CLI 发送请求
+```
+
+### 3. 查看日志
+```bash
+# 查看实时日志
+tail -f log/clewdr.log.$(date +%Y-%m-%d)
+
+# 查看请求内容
+cat log/claude_code_incoming_request.json
+cat log/claude_code_processed_request.json
+cat log/claude_code_outgoing_request.json
+```
+
+### 4. 分析日志
+
+检查点:
+- [ ] User-Agent 是什么
+- [ ] 原始 system prompt 内容
+- [ ] 是否成功注入 Claude Code prelude
+- [ ] 发送给 Anthropic 的最终请求格式
+
+---
+
+## 历史问题 (已修复)
+
+### OAI tool role 问题 ✅
+
+**问题**: `unknown variant 'tool', expected one of 'system', 'user', 'assistant'`
+
+**原因**: 导入了错误的类型 `CreateMessageParams as OaiCreateMessageParams`
+
+**修复**: 改为正确导入 `oai::OaiCreateMessageParams`
+
+### 功能测试结果 (2026-01-08)
+
+| 功能 | 状态 |
+|------|------|
+| Write (写入文件) | ✅ |
+| Read (读取文件) | ✅ |
+| Glob (文件搜索) | ✅ |
+| Bash (执行命令) | ✅ |
+| 图片识别 | ✅ |
+| WebSearch (网络搜索) | ✅ |
+| 根路径前端界面 | ✅ |
+
+---
+
+## 模块概览
+
+`src/format/` 模块:
 
 | 模块 | 功能 | 状态 |
 |------|------|------|
-| `signature_store.rs` | 思考模式签名存储 | ✅ 已集成 |
-| `schema_cleaner.rs` | JSON Schema 清理 | ✅ 已集成 |
-| `param_remapper.rs` | 参数名重映射 | ✅ 已集成 |
-| `thinking_utils.rs` | Thinking 模式工具 | ✅ 已集成 |
-| `web_search.rs` | Web 搜索结果格式化 | ✅ 已集成 |
-| `image_converter.rs` | 图片格式转换 | ✅ 已集成 |
+| `signature_store.rs` | 思考模式签名存储 | ✅ |
+| `schema_cleaner.rs` | JSON Schema 清理 | ✅ |
+| `param_remapper.rs` | 参数名重映射 | ✅ |
+| `thinking_utils.rs` | Thinking 模式工具 | ✅ |
+| `web_search.rs` | Web 搜索结果格式化 | ✅ |
+| `image_converter.rs` | 图片格式转换 | ✅ |
 
-## 二、基础功能测试结果
+---
 
-| 测试项 | 结果 | 详情 |
-|--------|------|------|
-| Claude 原生格式认证 (x-api-key) | ✅ 通过 | |
-| OpenAI 格式认证 (Bearer) | ✅ 通过 | |
-| Claude 格式消息（无工具） | ✅ 通过 | 测试消息正确响应 |
-| OpenAI 格式消息（无工具） | ✅ 通过 | 测试消息正确响应 |
-| 图片 (OAI image_url data:URI) | ✅ 通过 | 成功识别 1x1 像素图片 |
-| **OAI tool role 消息** | ✅ 通过 | 已修复导入和类型问题 |
-| **工具调用 (Write/Read/Glob/Bash)** | ✅ 通过 | 2026-01-07 23:30 验证 |
-| **WebSearch** | ✅ 通过 | 2026-01-08 验证 |
+## Release 历史
 
-## 三、潜在风险分析
+| 版本 | 日期 | 主要修复 |
+|------|------|----------|
+| v0.12.2 | 2026-01-09 | OAI tool role 支持、format 模块集成 |
+| v0.12.3 | 2026-01-11 | Claude Code system prompt 检测逻辑改进 |
+| v0.12.4 | 2026-01-11 | 认证中间件同时支持 Bearer Token 和 X-API-Key |
+| v0.12.5 | 2026-01-11 | 添加完整请求日志功能 |
 
-### Cookie 封号风险排查
+---
 
-如果使用修改版后出现 Cookie 被封情况，可能的原因：
+## 相关文件
 
-1. **Claude Web 路径 (`/v1/`)**: `transform.rs` 中的 Thinking 内容会被转换为 `<thinking>` 标签发送
-2. **IP/代理问题**: 与代码无关，需检查 IP 环境
-3. **使用频率**: 高频请求可能触发风控
+- **认证中间件**: `src/middleware/auth.rs`
+- **请求处理**: `src/middleware/claude/request.rs`
+- **Claude Code 聊天**: `src/claude_code_state/chat.rs`
+- **路由配置**: `src/router.rs`
 
-**排查建议**:
-- 确认使用的是 Claude Code 路径 (`/code/v1/`) 还是 Claude Web 路径 (`/v1/`)
-- Claude Code 路径直接调用 Anthropic API，不涉及 transform 逻辑
-- 如使用 Claude Web 并怀疑 `<thinking>` 标签导致问题，可在 `transform.rs` 中移除相关代码
+---
 
-## 四、参考项目
+## 参考项目
 
-本 fork 的格式转换思路参考：
 - [antigravity-claude-proxy](https://github.com/badri-s/antigravity-claude-proxy) - 格式转换模式
 - [claude-code-router](https://github.com/musistudio/claude-code-router) - Schema 清理和 Web Search 格式化
 
 ---
 
-*报告更新时间: 2026-01-09*
+*更新时间: 2026-01-11 14:30*

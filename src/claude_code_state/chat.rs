@@ -7,7 +7,7 @@ use eventsource_stream::Eventsource;
 use futures::TryStreamExt;
 use http::header::{ACCEPT, USER_AGENT};
 use snafu::{GenerateImplicitData, ResultExt};
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, error, info, warn, debug};
 use wreq::Method;
 
 use crate::{
@@ -183,8 +183,38 @@ impl ClaudeCodeState {
             CLAUDE_BETA_BASE
         };
 
+        let url = self.endpoint.join("v1/messages").expect("Url parse error");
+
+        // Log the outgoing request for debugging
+        debug!("[CLAUDE_CODE] Sending request to: {}", url);
+        debug!("[CLAUDE_CODE] anthropic-beta: {}", beta_header);
+        debug!("[CLAUDE_CODE] anthropic-version: {}", CLAUDE_API_VERSION);
+        debug!("[CLAUDE_CODE] model: {}", body.model);
+        debug!("[CLAUDE_CODE] stream: {:?}", body.stream);
+
+        // Log system prompt info (truncated for security)
+        if let Some(ref system) = body.system {
+            let system_str = system.to_string();
+            let preview = if system_str.len() > 500 {
+                format!("{}... (truncated, total {} chars)", &system_str[..500], system_str.len())
+            } else {
+                system_str
+            };
+            debug!("[CLAUDE_CODE] system: {}", preview);
+        }
+
+        // Save full request to log file for detailed debugging
+        if let Ok(json_str) = serde_json::to_string_pretty(body) {
+            let log_path = "log/claude_code_outgoing_request.json";
+            if let Err(e) = std::fs::write(log_path, &json_str) {
+                warn!("[CLAUDE_CODE] Failed to write request log: {}", e);
+            } else {
+                info!("[CLAUDE_CODE] Full request saved to {}", log_path);
+            }
+        }
+
         self.client
-            .post(self.endpoint.join("v1/messages").expect("Url parse error"))
+            .post(url)
             .bearer_auth(access_token)
             .header("anthropic-beta", beta_header)
             .header("anthropic-version", CLAUDE_API_VERSION)

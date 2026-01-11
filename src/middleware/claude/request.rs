@@ -310,7 +310,23 @@ where
             .unwrap_or_default()
             .to_lowercase();
         let is_from_cc = ua.contains("claude-code") || ua.contains("claude-cli");
+
+        // Log incoming request info
+        tracing::info!("[CLAUDE_CODE_PREPROCESS] User-Agent: {}", ua);
+        tracing::info!("[CLAUDE_CODE_PREPROCESS] Is from Claude Code client: {}", is_from_cc);
+
         let NormalizeRequest(mut body, format) = NormalizeRequest::from_request(req, &()).await?;
+
+        // Log the incoming request body for debugging
+        if let Ok(json_str) = serde_json::to_string_pretty(&body) {
+            let log_path = "log/claude_code_incoming_request.json";
+            if let Err(e) = std::fs::write(log_path, &json_str) {
+                tracing::warn!("[CLAUDE_CODE_PREPROCESS] Failed to write incoming request log: {}", e);
+            } else {
+                tracing::info!("[CLAUDE_CODE_PREPROCESS] Incoming request saved to {}", log_path);
+            }
+        }
+
         // Handle thinking mode by modifying the model name
         if (body.model.contains("opus-4-1")
             || body.model.contains("sonnet-4-5")
@@ -344,7 +360,9 @@ where
             }),
             _ => false,
         };
-        
+
+        tracing::info!("[CLAUDE_CODE_PREPROCESS] Has Claude Code system prompt: {}", has_claude_code_system);
+
         // Add Claude Code prelude if not already present
         // This is required for Claude Code API to work correctly
         if !has_claude_code_system {
@@ -357,6 +375,7 @@ where
                     .unwrap_or_else(|| PRELUDE_TEXT.to_string()),
                 cache_control: None,
             };
+            tracing::info!("[CLAUDE_CODE_PREPROCESS] Injecting Claude Code prelude system prompt");
             match body.system {
                 Some(Value::String(ref text)) => {
                     let text_content = ContentBlock::Text {
@@ -371,6 +390,22 @@ where
                 _ => {
                     body.system = Some(json!([prelude_blk]));
                 }
+            }
+        }
+
+        // Log the final system prompt after processing
+        if let Some(ref system) = body.system {
+            let system_str = system.to_string();
+            tracing::debug!("[CLAUDE_CODE_PREPROCESS] Final system prompt length: {} chars", system_str.len());
+        }
+
+        // Save the processed request (with injected system prompt) for debugging
+        if let Ok(json_str) = serde_json::to_string_pretty(&body) {
+            let log_path = "log/claude_code_processed_request.json";
+            if let Err(e) = std::fs::write(log_path, &json_str) {
+                tracing::warn!("[CLAUDE_CODE_PREPROCESS] Failed to write processed request log: {}", e);
+            } else {
+                tracing::info!("[CLAUDE_CODE_PREPROCESS] Processed request saved to {}", log_path);
             }
         }
 
