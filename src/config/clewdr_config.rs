@@ -71,6 +71,10 @@ pub struct ClewdrConfig {
     #[serde(default)]
     pub auto_update: bool,
     #[serde(default)]
+    pub update_url: Option<String>,
+    #[serde(default)]
+    pub model_list_url: Option<String>,
+    #[serde(default)]
     pub no_fs: bool,
     #[serde(default)]
     pub log_to_file: bool,
@@ -136,6 +140,8 @@ impl Default for ClewdrConfig {
             max_retries: default_max_retries(),
             check_update: default_check_update(),
             auto_update: false,
+            update_url: None,
+            model_list_url: None,
             cookie_array: HashSet::new(),
             wasted_cookie: HashSet::new(),
             password: String::new(),

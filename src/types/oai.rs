@@ -194,12 +194,71 @@ impl From<OaiTool> for Tool {
     }
 }
 
+/// Generate a unique server tool use ID for reconstructing web search blocks.
+/// Format mimics Claude's `srvtoolu_` prefix convention.
+fn generate_srvtoolu_id() -> String {
+    format!("srvtoolu_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Convert OAI annotations to Claude `ServerToolUse` + `WebSearchToolResult` content block pair.
+///
+/// This properly reconstructs the server-side tool blocks that Claude API uses
+/// for web search. These blocks are paired within the same assistant message:
+/// - `server_tool_use` with a generated ID and name "web_search"
+/// - `web_search_tool_result` with matching tool_use_id and search result content
+fn annotations_to_server_tool_blocks(annotations: &[Value]) -> Vec<ContentBlock> {
+    let web_search_content = annotations_to_web_search_content(annotations);
+    if web_search_content.is_empty() {
+        return vec![];
+    }
+
+    let id = generate_srvtoolu_id();
+    tracing::debug!(
+        "[OAI→Claude] Converting {} annotations to ServerToolUse + WebSearchToolResult pair (id: {})",
+        annotations.len(),
+        id
+    );
+
+    vec![
+        ContentBlock::ServerToolUse {
+            data: json!({
+                "id": id,
+                "name": "web_search",
+                "input": {"query": ""}
+            }),
+        },
+        ContentBlock::WebSearchToolResult {
+            data: json!({
+                "tool_use_id": id,
+                "content": web_search_content
+            }),
+        },
+    ]
+}
+
+/// Sanitize a tool ID to match Claude API's required pattern: ^[a-zA-Z0-9_-]+$
+/// Replaces any invalid characters with underscores.
+fn sanitize_tool_id(id: &str) -> String {
+    if id.is_empty() {
+        return id.to_string();
+    }
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Convert OAI message to Claude message
 fn convert_oai_message(msg: OaiMessage) -> Message {
     match msg.role {
         OaiRole::Tool => {
             // Convert tool role to user message with tool_result block
-            let tool_use_id = msg.tool_call_id.unwrap_or_default();
+            let tool_use_id = sanitize_tool_id(&msg.tool_call_id.unwrap_or_default());
             // Claude API requires tool_result.content to be a string or array of content blocks
             // NOT a JSON object. Keep the content as a string.
             let content_value = match msg.content {
@@ -255,14 +314,22 @@ fn convert_oai_message(msg: OaiMessage) -> Message {
                 // Apply OAI → Claude parameter remapping
                 remap_oai_to_claude_args(&tc.function.name, &mut input);
                 blocks.push(ContentBlock::ToolUse {
-                    id: tc.id,
+                    id: sanitize_tool_id(&tc.id),
                     name: tc.function.name,
                     input,
                     signature: None,
                     cache_control: None,
                 });
             }
-            
+
+            // Handle annotations on assistant messages with tool_calls
+            // (e.g. when assistant uses both web search and user-defined tools)
+            if let Some(ref annotations) = msg.annotations {
+                if !annotations.is_empty() {
+                    blocks.extend(annotations_to_server_tool_blocks(annotations));
+                }
+            }
+
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Blocks { content: blocks },
@@ -299,20 +366,26 @@ fn convert_oai_message(msg: OaiMessage) -> Message {
                 OaiMessageContent::Null => {}
             };
             
-            // Handle annotations (web search citations) -> convert to Claude web_search format
-            if let Some(annotations) = msg.annotations {
+            // Handle annotations (web search citations)
+            if let Some(ref annotations) = msg.annotations {
                 if !annotations.is_empty() {
-                    let web_search_content = annotations_to_web_search_content(&annotations);
-                    if !web_search_content.is_empty() {
-                        tracing::debug!(
-                            "[OAI→Claude] Converting {} annotations to web search content",
-                            annotations.len()
-                        );
-                        // Add as tool result with web search content
-                        blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: "web_search".to_string(),
-                            content: json!(web_search_content),
-                            is_error: None,
+                    if msg.role == OaiRole::Assistant {
+                        // Assistant messages: reconstruct ServerToolUse + WebSearchToolResult pair
+                        blocks.extend(annotations_to_server_tool_blocks(annotations));
+                    } else {
+                        // Non-assistant messages: convert to readable text citations
+                        let mut citation_text = String::from("\n\n[Sources]\n");
+                        for ann in annotations {
+                            if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation") {
+                                if let Some(citation) = ann.get("url_citation") {
+                                    let title = citation.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
+                                    let url = citation.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                    citation_text.push_str(&format!("- [{}]({})\n", title, url));
+                                }
+                            }
+                        }
+                        blocks.push(ContentBlock::Text {
+                            text: citation_text,
                             cache_control: None,
                         });
                     }
@@ -610,16 +683,15 @@ mod tests {
     fn test_oai_tool_role_conversion() {
         let msg = OaiMessage {
             role: OaiRole::Tool,
-            content: MessageContent::Text {
-                content: r#"{"result": "success"}"#.to_string(),
-            },
+            content: OaiMessageContent::Text(r#"{"result": "success"}"#.to_string()),
             tool_call_id: Some("call_123".to_string()),
             tool_calls: None,
+            annotations: None,
         };
-        
+
         let converted = convert_oai_message(msg);
         assert_eq!(converted.role, Role::User);
-        
+
         if let MessageContent::Blocks { content } = converted.content {
             assert_eq!(content.len(), 1);
             if let ContentBlock::ToolResult { tool_use_id, .. } = &content[0] {
@@ -636,9 +708,7 @@ mod tests {
     fn test_oai_assistant_with_tool_calls() {
         let msg = OaiMessage {
             role: OaiRole::Assistant,
-            content: MessageContent::Text {
-                content: "I'll search for that.".to_string(),
-            },
+            content: OaiMessageContent::Text("I'll search for that.".to_string()),
             tool_call_id: None,
             tool_calls: Some(vec![OaiToolCall {
                 id: "call_456".to_string(),
@@ -648,11 +718,12 @@ mod tests {
                     arguments: r#"{"query": "test"}"#.to_string(),
                 },
             }]),
+            annotations: None,
         };
-        
+
         let converted = convert_oai_message(msg);
         assert_eq!(converted.role, Role::Assistant);
-        
+
         if let MessageContent::Blocks { content } = converted.content {
             assert_eq!(content.len(), 2); // Text + ToolUse
             assert!(matches!(&content[0], ContentBlock::Text { .. }));
@@ -660,6 +731,62 @@ mod tests {
         } else {
             panic!("Expected Blocks content");
         }
+    }
+
+    #[test]
+    fn test_sanitize_tool_id() {
+        // Normal ID should pass through
+        assert_eq!(sanitize_tool_id("call_123"), "call_123");
+        // Dots should be replaced with underscores
+        assert_eq!(sanitize_tool_id("call_123.456"), "call_123_456");
+        // Mixed invalid chars
+        assert_eq!(sanitize_tool_id("call.123@foo"), "call_123_foo");
+        // Empty string
+        assert_eq!(sanitize_tool_id(""), "");
+        // Already valid with hyphens
+        assert_eq!(sanitize_tool_id("call-123_abc"), "call-123_abc");
+    }
+
+    #[test]
+    fn test_annotations_to_server_tool_blocks() {
+        let annotations = vec![json!({
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://example.com",
+                "title": "Example",
+                "content": "Snippet"
+            }
+        })];
+
+        let blocks = annotations_to_server_tool_blocks(&annotations);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::ServerToolUse { .. }));
+        assert!(matches!(&blocks[1], ContentBlock::WebSearchToolResult { .. }));
+
+        // Verify IDs match
+        if let (
+            ContentBlock::ServerToolUse { data: stu_data },
+            ContentBlock::WebSearchToolResult { data: wsr_data },
+        ) = (&blocks[0], &blocks[1])
+        {
+            let stu_id = stu_data.get("id").and_then(|v| v.as_str()).unwrap();
+            let wsr_id = wsr_data.get("tool_use_id").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(stu_id, wsr_id);
+            assert!(stu_id.starts_with("srvtoolu_"));
+        } else {
+            panic!("Expected ServerToolUse + WebSearchToolResult pair");
+        }
+    }
+
+    #[test]
+    fn test_empty_annotations_produce_no_blocks() {
+        let blocks = annotations_to_server_tool_blocks(&[]);
+        assert!(blocks.is_empty());
+
+        // Non-citation annotations should also produce nothing
+        let annotations = vec![json!({"type": "other_type"})];
+        let blocks = annotations_to_server_tool_blocks(&annotations);
+        assert!(blocks.is_empty());
     }
 
     #[test]

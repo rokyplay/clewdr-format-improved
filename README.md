@@ -33,7 +33,7 @@ Streaming responses work on every endpoint.
 1. Download the latest release for your platform from GitHub.
    Linux/macOS example (this fork):
    ```bash
-   curl -L -o clewdr https://github.com/rokyplay/clewdr-format-improved/releases/download/v0.12.2-format-improved/clewdr-linux-x64
+   curl -L -o clewdr https://github.com/rokyplay/clewdr-format-improved/releases/latest/download/clewdr-linux-x64
    chmod +x clewdr
    ```
 2. Run the binary:

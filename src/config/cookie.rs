@@ -82,6 +82,18 @@ pub struct CookieStatus {
     #[serde(default)]
     pub count_tokens_allowed: Option<bool>,
 
+    // Analytics: timestamps
+    #[serde(default)]
+    pub added_at: Option<i64>,
+    #[serde(default)]
+    pub first_request_at: Option<i64>,
+    #[serde(default)]
+    pub last_request_at: Option<i64>,
+
+    // Analytics: request count
+    #[serde(default)]
+    pub request_count: u64,
+
     // New: Per-period usage breakdown
     #[serde(default)]
     pub session_usage: UsageBreakdown,
@@ -164,6 +176,11 @@ impl CookieStatus {
             supports_claude_1m: None,
             count_tokens_allowed: None,
 
+            added_at: None,
+            first_request_at: None,
+            last_request_at: None,
+            request_count: 0,
+
             session_usage: UsageBreakdown::default(),
             weekly_usage: UsageBreakdown::default(),
             weekly_sonnet_usage: UsageBreakdown::default(),
@@ -221,6 +238,16 @@ impl CookieStatus {
         self.weekly_usage = UsageBreakdown::default();
         self.weekly_sonnet_usage = UsageBreakdown::default();
         self.weekly_opus_usage = UsageBreakdown::default();
+    }
+
+    /// Increment request count and update timestamps
+    pub fn increment_request(&mut self) {
+        let now = chrono::Utc::now().timestamp();
+        self.request_count = self.request_count.saturating_add(1);
+        self.last_request_at = Some(now);
+        if self.first_request_at.is_none() {
+            self.first_request_at = Some(now);
+        }
     }
 
     // ------------------------

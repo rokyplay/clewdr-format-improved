@@ -12,7 +12,8 @@ use axum_auth::AuthBearer;
 use moka::sync::Cache;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 use wreq::StatusCode;
 
 use super::error::ApiError;
@@ -238,13 +239,50 @@ pub async fn api_auth(AuthBearer(t): AuthBearer) -> StatusCode {
     StatusCode::OK
 }
 
-const MODEL_LIST: [&str; 14] = [
+/// API endpoint to trigger an immediate update check.
+/// Used by the dashboard to remotely update clewdr instances.
+///
+/// # Returns
+/// * `Result<Json<Value>, ApiError>` - Status of the triggered update
+pub async fn api_trigger_update(AuthBearer(t): AuthBearer) -> Result<Json<Value>, ApiError> {
+    if !CLEWDR_CONFIG.load().admin_auth(&t) {
+        return Err(ApiError::unauthorized());
+    }
+
+    #[cfg(feature = "portable")]
+    {
+        info!("Remote update trigger received");
+        tokio::spawn(async {
+            // Small delay to ensure HTTP response is sent before potential process exit
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match crate::services::update::ClewdrUpdater::new() {
+                Ok(updater) => match updater.trigger_remote_update().await {
+                    Ok(true) => info!("Remote update: new version installed, restarting..."),
+                    Ok(false) => info!("Remote update: already at latest version"),
+                    Err(e) => error!("Remote update failed: {}", e),
+                },
+                Err(e) => error!("Failed to create updater: {}", e),
+            }
+        });
+        return Ok(Json(json!({"status": "update_check_triggered"})));
+    }
+
+    #[cfg(not(feature = "portable"))]
+    Err(ApiError::internal(
+        "Update not available: portable feature not enabled".to_string(),
+    ))
+}
+
+/// Fallback model list when dynamic fetching fails
+const FALLBACK_MODEL_LIST: [&str; 18] = [
     "claude-3-7-sonnet-20250219",
     "claude-3-7-sonnet-20250219-thinking",
     "claude-sonnet-4-20250514",
     "claude-sonnet-4-20250514-thinking",
     "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-5-20250929-thinking",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking",
     "claude-opus-4-20250514",
     "claude-opus-4-20250514-thinking",
     "claude-opus-4-1-20250805",
@@ -253,12 +291,109 @@ const MODEL_LIST: [&str; 14] = [
     "claude-opus-4-5-20251101-thinking",
     "claude-opus-4-5",
     "claude-opus-4-5-thinking",
+    "claude-opus-4-6",
+    "claude-opus-4-6-thinking",
 ];
 
-/// API endpoint to get the list of available models
-/// Retrieves the list of models from the configuration
-pub async fn api_get_models() -> Json<Value> {
-    let data: Vec<Value> = MODEL_LIST
+/// Cached model list with timestamp
+struct ModelListCache {
+    models: Vec<Value>,
+    timestamp: u64,
+}
+
+/// Global cache for model list (TTL: 1 hour)
+static MODEL_LIST_CACHE: LazyLock<RwLock<Option<ModelListCache>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Cache TTL in seconds (1 hour)
+const MODEL_CACHE_TTL_SECS: u64 = 3600;
+
+/// Fetch models from configured model list server
+async fn fetch_models_from_api() -> Option<Vec<Value>> {
+    let model_list_url = CLEWDR_CONFIG.load().model_list_url.clone()?;
+    let client = wreq::Client::new();
+
+    debug!("Fetching models from: {}", model_list_url);
+
+    let response = client
+        .get(&model_list_url)
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        warn!(
+            "Failed to fetch models from server, status: {}",
+            response.status()
+        );
+        return None;
+    }
+
+    let json: Value = response.json().await.ok()?;
+
+    // Extract model data from the response
+    let models = json.get("data")?.as_array()?;
+
+    let result: Vec<Value> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?;
+            if !id.starts_with("claude-") {
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "object": "model",
+                "created": m.get("created").unwrap_or(&json!(0)),
+                "owned_by": m.get("owned_by").and_then(|v| v.as_str()).unwrap_or("anthropic"),
+            }))
+        })
+        .collect();
+
+    if result.is_empty() {
+        None
+    } else {
+        info!("Successfully fetched {} models from server", result.len());
+        Some(result)
+    }
+}
+
+/// Get current timestamp in seconds
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+/// Get models with caching support
+async fn get_cached_models() -> Vec<Value> {
+    let now = current_timestamp();
+
+    // Check if cache is valid
+    {
+        let cache = MODEL_LIST_CACHE.read().await;
+        if let Some(ref cached) = *cache {
+            if now - cached.timestamp < MODEL_CACHE_TTL_SECS {
+                debug!("Returning cached model list");
+                return cached.models.clone();
+            }
+        }
+    }
+
+    // Try to fetch from API
+    if let Some(models) = fetch_models_from_api().await {
+        let mut cache = MODEL_LIST_CACHE.write().await;
+        *cache = Some(ModelListCache {
+            models: models.clone(),
+            timestamp: now,
+        });
+        return models;
+    }
+
+    // Fall back to static list
+    warn!("Using fallback model list");
+    FALLBACK_MODEL_LIST
         .iter()
         .map(|model| {
             json!({
@@ -268,7 +403,13 @@ pub async fn api_get_models() -> Json<Value> {
                 "owned_by": "clewdr",
             })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// API endpoint to get the list of available models
+/// Dynamically fetches from Anthropic API with fallback to static list
+pub async fn api_get_models() -> Json<Value> {
+    let data = get_cached_models().await;
     Json(json!({
         "object": "list",
         "data": data,

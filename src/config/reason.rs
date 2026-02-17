@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::CookieStatus;
+use super::{CookieStatus, UsageBreakdown};
 use crate::config::ClewdrCookie;
 
 /// Reason why a cookie is considered useless
@@ -50,6 +50,20 @@ impl Display for Reason {
 pub struct UselessCookie {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
+
+    // Analytics: preserved from CookieStatus when invalidated
+    #[serde(default)]
+    pub added_at: Option<i64>,
+    #[serde(default)]
+    pub invalidated_at: Option<i64>,
+    #[serde(default)]
+    pub first_request_at: Option<i64>,
+    #[serde(default)]
+    pub last_request_at: Option<i64>,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub lifetime_usage: UsageBreakdown,
 }
 
 impl PartialEq<CookieStatus> for UselessCookie {
@@ -73,7 +87,7 @@ impl Hash for UselessCookie {
 }
 
 impl UselessCookie {
-    /// Creates a new UselessCookie instance
+    /// Creates a new UselessCookie instance (legacy, without analytics)
     ///
     /// # Arguments
     /// * `cookie` - The cookie that is unusable
@@ -82,6 +96,29 @@ impl UselessCookie {
     /// # Returns
     /// A new UselessCookie instance
     pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
-        Self { cookie, reason }
+        Self {
+            cookie,
+            reason,
+            added_at: None,
+            invalidated_at: None,
+            first_request_at: None,
+            last_request_at: None,
+            request_count: 0,
+            lifetime_usage: UsageBreakdown::default(),
+        }
+    }
+
+    /// Creates a UselessCookie from a CookieStatus, preserving analytics data
+    pub fn from_cookie_status(status: &CookieStatus, reason: Reason) -> Self {
+        Self {
+            cookie: status.cookie.clone(),
+            reason,
+            added_at: status.added_at,
+            invalidated_at: Some(chrono::Utc::now().timestamp()),
+            first_request_at: status.first_request_at,
+            last_request_at: status.last_request_at,
+            request_count: status.request_count,
+            lifetime_usage: status.lifetime_usage.clone(),
+        }
     }
 }

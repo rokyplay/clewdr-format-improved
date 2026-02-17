@@ -238,22 +238,20 @@ impl CookieActor {
             }
             Reason::Free => {
                 find_remove(&cookie);
-                let mut removed = cookie.clone();
-                removed.reset_window_usage();
+                // Use from_cookie_status to preserve analytics data
                 if !state
                     .invalid
-                    .insert(UselessCookie::new(removed.cookie.clone(), reason))
+                    .insert(UselessCookie::from_cookie_status(&cookie, reason))
                 {
                     return;
                 }
             }
             _ => {
                 find_remove(&cookie);
-                let mut removed = cookie.clone();
-                removed.reset_window_usage();
+                // Use from_cookie_status to preserve analytics data
                 if !state
                     .invalid
-                    .insert(UselessCookie::new(removed.cookie.clone(), reason))
+                    .insert(UselessCookie::from_cookie_status(&cookie, reason))
                 {
                     return;
                 }
@@ -264,7 +262,7 @@ impl CookieActor {
     }
 
     /// Accepts a new cookie into the valid collection
-    fn accept(state: &mut CookieActorState, cookie: CookieStatus) {
+    fn accept(state: &mut CookieActorState, mut cookie: CookieStatus) {
         if CLEWDR_CONFIG.load().cookie_array.contains(&cookie)
             || CLEWDR_CONFIG
                 .load()
@@ -274,6 +272,10 @@ impl CookieActor {
         {
             warn!("Cookie already exists");
             return;
+        }
+        // Set added_at timestamp for new cookies
+        if cookie.added_at.is_none() {
+            cookie.added_at = Some(chrono::Utc::now().timestamp());
         }
         state.valid.push_back(cookie);
         Self::save(state);

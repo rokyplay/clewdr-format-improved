@@ -50,11 +50,6 @@ pub enum EventContent {
     Reasoning { reasoning_content: String },
     ToolCalls { tool_calls: Vec<ToolCallDelta> },
     Annotations { annotations: Vec<Value> },
-    /// Combined content with annotations (for web search results)
-    ContentWithAnnotations {
-        content: String,
-        annotations: Vec<Value>,
-    },
 }
 
 /// Tool call delta for streaming
@@ -86,7 +81,6 @@ struct ToolCallState {
 #[derive(Debug, Clone, Default)]
 struct WebSearchState {
     citations: Vec<Citation>,
-    tool_use_id: String,
 }
 
 /// Creates an SSE event with the given content in OpenAI format
@@ -187,19 +181,11 @@ where
                         }
                         // Handle web_search_tool_result block start
                         ContentBlock::WebSearchToolResult { data } => {
-                            let tool_use_id = data
-                                .get("tool_use_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
                             let citations = extract_citations_from_tool_result(&data);
                             let mut ws_buf = ws_buffer.lock().unwrap();
                             ws_buf.insert(
                                 index,
-                                WebSearchState {
-                                    citations,
-                                    tool_use_id,
-                                },
+                                WebSearchState { citations },
                             );
                         }
                         // Handle search_result block start
@@ -208,10 +194,7 @@ where
                             let mut ws_buf = ws_buffer.lock().unwrap();
                             ws_buf.insert(
                                 index,
-                                WebSearchState {
-                                    citations,
-                                    tool_use_id: String::new(),
-                                },
+                                WebSearchState { citations },
                             );
                         }
                         _ => {}

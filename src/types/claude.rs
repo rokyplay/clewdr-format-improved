@@ -89,11 +89,22 @@ impl CreateMessageParams {
     }
 }
 
+/// Default budget tokens for thinking mode
+fn default_budget_tokens() -> u64 {
+    10000
+}
+
 /// Thinking mode in Claude API Request
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Thinking {
+    #[serde(default = "default_budget_tokens")]
     pub budget_tokens: u64,
+    #[serde(default = "default_thinking_type")]
     r#type: String,
+}
+
+fn default_thinking_type() -> String {
+    "enabled".to_string()
 }
 
 impl Thinking {
@@ -643,7 +654,7 @@ impl CreateMessageResponse {
 }
 
 /// Reason for stopping message generation
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -977,7 +988,7 @@ mod tests {
         
         if let MessageContent::Blocks { content } = &params.messages[0].content {
             assert_eq!(content.len(), 1);
-            if let ContentBlock::Thinking { thinking, signature } = &content[0] {
+            if let ContentBlock::Thinking { thinking, signature, .. } = &content[0] {
                 assert_eq!(thinking, "Let me think about this...");
                 assert_eq!(signature, &Some("valid_signature_12345".to_string()));
             } else {

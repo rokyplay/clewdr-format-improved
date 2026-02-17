@@ -9,7 +9,7 @@
 //! - antigravity-claude-proxy/src/format/schema-sanitizer.js
 //! - claude-code-router/packages/core/src/utils/gemini.util.ts
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 /// Keywords not supported by some API providers (especially Gemini)
 const UNSUPPORTED_KEYWORDS: &[&str] = &[
@@ -47,6 +47,7 @@ const UNSUPPORTED_KEYWORDS: &[&str] = &[
 
 /// Valid fields that should be preserved
 /// Reference: claude-code-router validFields
+#[allow(dead_code)]
 const VALID_FIELDS: &[&str] = &[
     "type",
     "format",  // Some providers support this

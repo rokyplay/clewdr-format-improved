@@ -115,6 +115,8 @@ async fn main() -> Result<(), ClewdrError> {
         if let Err(e) = updater.check_for_updates().await {
             warn!("Update check failed: {}", e);
         }
+        // Spawn periodic update checker (every 30 minutes)
+        updater.spawn_periodic_check();
     }
 
     // print info

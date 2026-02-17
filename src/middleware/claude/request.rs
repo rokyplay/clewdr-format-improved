@@ -16,7 +16,7 @@ use crate::{
     config::CLEWDR_CONFIG,
     error::ClewdrError,
     format::{
-        analyze_conversation_state, clean_cache_control_from_messages, clear_thought_signature,
+        analyze_conversation_state, clean_cache_control_from_messages,
         extract_signatures, get_thought_signature, has_valid_signature_for_function_calls,
         message_has_tool_result, needs_thinking_recovery, process_image_blocks,
         should_disable_thinking_due_to_history, strip_invalid_thinking_blocks,
@@ -123,6 +123,73 @@ fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
+/// Validate tool_result/tool_use pairing in messages.
+///
+/// Claude API requires every `tool_result` block's `tool_use_id` to have a matching
+/// `tool_use` (or `server_tool_use`) block in a preceding assistant message.
+/// This function removes orphaned `tool_result` blocks that have no matching `tool_use`.
+fn validate_tool_pairing(msgs: Vec<Message>) -> Vec<Message> {
+    // First pass: collect all tool_use IDs from assistant messages
+    let mut tool_use_ids = std::collections::HashSet::new();
+    for msg in &msgs {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if let MessageContent::Blocks { content } = &msg.content {
+            for block in content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        tool_use_ids.insert(id.clone());
+                    }
+                    ContentBlock::ServerToolUse { data } => {
+                        if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                            tool_use_ids.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Second pass: filter out orphaned tool_result blocks
+    msgs.into_iter()
+        .filter_map(|msg| {
+            if msg.role != Role::User {
+                return Some(msg);
+            }
+            if let MessageContent::Blocks { content } = msg.content {
+                let filtered: Vec<ContentBlock> = content
+                    .into_iter()
+                    .filter(|block| {
+                        if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                            if !tool_use_ids.contains(tool_use_id) {
+                                tracing::warn!(
+                                    "[Format] Removing orphaned tool_result with tool_use_id: {}",
+                                    tool_use_id
+                                );
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    // Drop user message if all blocks were removed
+                    None
+                } else {
+                    Some(Message {
+                        role: Role::User,
+                        content: MessageContent::Blocks { content: filtered },
+                    })
+                }
+            } else {
+                Some(msg)
+            }
+        })
+        .collect()
+}
+
 impl<S> FromRequest<S> for NormalizeRequest
 where
     S: Send + Sync,
@@ -179,7 +246,10 @@ where
         };
         // Sanitize messages: trim whitespace and drop whitespace-only assistant turns
         body.messages = sanitize_messages(body.messages);
-        
+
+        // Validate tool_result/tool_use pairing: remove orphaned tool_result blocks
+        body.messages = validate_tool_pairing(body.messages);
+
         // Process image_url blocks in messages (OpenAI -> Claude conversion)
         body.messages = body
             .messages

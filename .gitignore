@@ -13,4 +13,6 @@ static/
 .codex
 test
 scripts
-AGENTS.md/docs/
+AGENTS.md
+docs/
+build.sh

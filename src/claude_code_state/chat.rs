@@ -119,23 +119,9 @@ impl ClaudeCodeState {
             None => (p.model.clone(), false),
         };
 
-        let is_sonnet = Self::is_sonnet4_model(&base_model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| cookie.supports_claude_1m);
-
-        let attempts: Vec<bool> = if is_sonnet {
-            match cookie_support {
-                Some(true) => vec![true],
-                Some(false) => vec![false],
-                None => vec![true, false],
-            }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
+        let supports_1m = Self::supports_1m_context(&base_model);
+        // 没有 -1M 后缀就永远不用 1M
+        let attempts: Vec<bool> = vec![requested_1m];
 
         p.model = base_model;
         let model_family = Self::classify_model(&p.model);
@@ -145,13 +131,13 @@ impl ClaudeCodeState {
             match self.execute_claude_request(&access_token, &p, use_1m).await {
                 Ok(response) => {
                     return self
-                        .handle_success_response(response, is_sonnet && use_1m, model_family)
+                        .handle_success_response(response, supports_1m && use_1m, model_family)
                         .await;
                 }
                 Err(err) => {
                     let is_last_attempt = idx + 1 == attempts.len();
                     let should_retry = use_1m
-                        && is_sonnet
+                        && supports_1m
                         && !is_last_attempt
                         && Self::is_context_1m_forbidden(&err);
 
@@ -177,11 +163,34 @@ impl ClaudeCodeState {
         body: &CreateMessageParams,
         use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
+        use crate::types::claude::{Message, Role};
+
         let beta_header = if use_context_1m {
             CLAUDE_BETA_CONTEXT_1M
         } else {
             CLAUDE_BETA_BASE
         };
+
+        // Clone body for potential modification
+        let mut body = body.clone();
+
+        // Claude 4+ models don't support temperature and top_p at the same time
+        // If both are set, remove top_p (temperature is more commonly used)
+        if body.temperature.is_some() && body.top_p.is_some() {
+            debug!("[CLAUDE_CODE] Both temperature and top_p set, removing top_p for Claude 4+ compatibility");
+            body.top_p = None;
+        }
+
+        // Opus 4.6 does not support assistant message prefill
+        // If last message is assistant, add a user message to continue
+        if Self::is_opus46_model(&body.model) {
+            if let Some(last_msg) = body.messages.last() {
+                if last_msg.role == Role::Assistant {
+                    debug!("[CLAUDE_CODE] Opus 4.6 detected with assistant prefill, adding continue message");
+                    body.messages.push(Message::new_text(Role::User, "continue"));
+                }
+            }
+        }
 
         let url = self.endpoint.join("v1/messages").expect("Url parse error");
 
@@ -204,7 +213,7 @@ impl ClaudeCodeState {
         }
 
         // Save full request to log file for detailed debugging
-        if let Ok(json_str) = serde_json::to_string_pretty(body) {
+        if let Ok(json_str) = serde_json::to_string_pretty(&body) {
             let log_path = "log/claude_code_outgoing_request.json";
             if let Err(e) = std::fs::write(log_path, &json_str) {
                 warn!("[CLAUDE_CODE] Failed to write request log: {}", e);
@@ -220,7 +229,7 @@ impl ClaudeCodeState {
             .header(ACCEPT, "application/json")
             .header("anthropic-beta", beta_header)
             .header("anthropic-version", CLAUDE_API_VERSION)
-            .json(body)
+            .json(&body)
             .send()
             .await
             .context(WreqSnafu {
@@ -385,23 +394,9 @@ impl ClaudeCodeState {
             None => (p.model.clone(), false),
         };
 
-        let is_sonnet = Self::is_sonnet4_model(&base_model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| cookie.supports_claude_1m);
-
-        let attempts: Vec<bool> = if is_sonnet {
-            match cookie_support {
-                Some(true) => vec![true],
-                Some(false) => vec![false],
-                None => vec![true, false],
-            }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
+        let supports_1m = Self::supports_1m_context(&base_model);
+        // 没有 -1M 后缀就永远不用 1M
+        let attempts: Vec<bool> = vec![requested_1m];
 
         p.model = base_model;
 
@@ -413,7 +408,7 @@ impl ClaudeCodeState {
             {
                 Ok(response) => {
                     self.persist_count_tokens_allowed(true).await;
-                    if is_sonnet && use_1m {
+                    if supports_1m && use_1m {
                         self.persist_claude_1m_support(true).await;
                     }
                     let (resp, _) = Self::materialize_non_stream_response(response).await?;
@@ -429,7 +424,7 @@ impl ClaudeCodeState {
                     }
                     let is_last_attempt = idx + 1 == attempts.len();
                     let should_retry = use_1m
-                        && is_sonnet
+                        && supports_1m
                         && !is_last_attempt
                         && Self::is_context_1m_forbidden(&err);
 
@@ -631,6 +626,23 @@ impl ClaudeCodeState {
         // "claude-sonnet-4" as Sonnet 4.x for 1M probing.
         let m = model.to_ascii_lowercase();
         m.contains("claude-sonnet-4")
+    }
+
+    /// Check if model is Opus 4.6 (does not support assistant prefill)
+    fn is_opus46_model(model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        m.contains("claude-opus-4-6") || m == "claude-opus-4.6"
+    }
+
+    fn is_opus4_model(model: &str) -> bool {
+        // Detect Opus 4.x models for 1M context support
+        let m = model.to_ascii_lowercase();
+        m.contains("claude-opus-4")
+    }
+
+    /// Check if model supports 1M context (Sonnet 4+ and Opus 4+)
+    fn supports_1m_context(model: &str) -> bool {
+        Self::is_sonnet4_model(model) || Self::is_opus4_model(model)
     }
 
     fn classify_model(model: &str) -> ModelFamily {

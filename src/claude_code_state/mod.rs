@@ -82,9 +82,11 @@ impl ClaudeCodeState {
 
     /// Returns the current cookie to the cookie manager
     /// Optionally provides a reason for returning the cookie (e.g., invalid, banned)
-    pub async fn return_cookie(&self, reason: Option<Reason>) {
+    pub async fn return_cookie(&mut self, reason: Option<Reason>) {
         // return the cookie to the cookie manager
-        if let Some(ref cookie) = self.cookie {
+        if let Some(ref mut cookie) = self.cookie {
+            // Increment request count before returning
+            cookie.increment_request();
             self.cookie_actor_handle
                 .return_cookie(cookie.to_owned(), reason)
                 .await

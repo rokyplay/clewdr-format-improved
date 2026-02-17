@@ -30,6 +30,13 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+/// Custom update server response
+#[derive(Debug, Deserialize)]
+struct CustomUpdateInfo {
+    version: String,
+    download_url: String,
+}
+
 /// Updater for the ClewdR application
 /// Handles checking for updates and updating the application
 pub struct ClewdrUpdater {
@@ -77,14 +84,14 @@ impl ClewdrUpdater {
         })
     }
 
-    /// Checks for updates by comparing the current version to the latest release on GitHub
+    /// Checks for updates by comparing the current version to the latest release
+    /// Supports both custom update URL and GitHub releases
     /// Performs automatic update if enabled in config or explicitly requested
     ///
     /// # Returns
     /// * `Result<bool, ClewdrError>` - True if update available, false otherwise
     pub async fn check_for_updates(&self) -> Result<bool, ClewdrError> {
         if CLEWDR_CONFIG.load().no_fs {
-            // If no_fs feature is enabled, skip update check
             info!("Update check skipped due to no_fs feature");
             return Ok(false);
         }
@@ -94,9 +101,110 @@ impl ClewdrUpdater {
             return Ok(false);
         }
 
-        info!("Checking for updates...");
-        // info!("User-Agent: {}", self.user_agent);
+        self.do_check(&args, false).await
+    }
 
+    /// Trigger an immediate update check and perform update if available.
+    /// Used by the remote trigger API endpoint. Bypasses config guards.
+    pub async fn trigger_remote_update(&self) -> Result<bool, ClewdrError> {
+        if CLEWDR_CONFIG.load().no_fs {
+            info!("Update skipped: no_fs mode");
+            return Ok(false);
+        }
+        let args: Args = clap::Parser::parse();
+        self.do_check(&args, true).await
+    }
+
+    /// Core update check logic, shared by startup and periodic checks
+    async fn do_check(&self, args: &Args, force: bool) -> Result<bool, ClewdrError> {
+        info!("Checking for updates...");
+
+        // Check if custom update URL is configured
+        if let Some(ref update_url) = CLEWDR_CONFIG.load().update_url {
+            return self.check_custom_update(update_url, args, force).await;
+        }
+
+        // Fall back to GitHub releases
+        self.check_github_update(args, force).await
+    }
+
+    /// Spawn a background task that periodically checks for updates.
+    /// Runs every 30 minutes. Only active when `check_update` is true.
+    pub fn spawn_periodic_check(self) {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(30 * 60));
+            // Skip the first immediate tick (startup check already ran)
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                let config = CLEWDR_CONFIG.load();
+                if !config.check_update || config.no_fs {
+                    continue;
+                }
+
+                let args: Args = clap::Parser::parse();
+                match self.do_check(&args, false).await {
+                    Ok(true) => info!("Periodic check: update available"),
+                    Ok(false) => info!("Periodic check: already up to date"),
+                    Err(e) => tracing::warn!("Periodic update check failed: {}", e),
+                }
+            }
+        });
+    }
+
+    /// Check for updates from a custom update server
+    async fn check_custom_update(&self, update_url: &str, args: &Args, force: bool) -> Result<bool, ClewdrError> {
+        info!("Checking custom update server: {}", update_url);
+
+        // Fetch version info from custom server
+        let version_url = format!("{}/version", update_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&version_url)
+            .header(USER_AGENT, &self.user_agent)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to fetch version from custom update server",
+            })?;
+
+        if !response.status().is_success() {
+            info!("Custom update server returned error, falling back to GitHub");
+            return self.check_github_update(args, force).await;
+        }
+
+        let update_info: CustomUpdateInfo = response.json().await.context(WreqSnafu {
+            msg: "Failed to parse custom update server response",
+        })?;
+
+        let latest_version = update_info.version.trim_start_matches('v');
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        let update_available = self.compare_versions(current_version, latest_version)?;
+
+        if !update_available {
+            info!("Already at the latest version {}", current_version.green());
+            return Ok(false);
+        }
+
+        info!(
+            "New version {} available (current: {})",
+            latest_version.green().italic(),
+            current_version.yellow()
+        );
+
+        if force || args.update || CLEWDR_CONFIG.load().auto_update {
+            self.perform_custom_update(&update_info.download_url, latest_version).await?;
+        }
+
+        Ok(true)
+    }
+
+    /// Check for updates from GitHub releases
+    async fn check_github_update(&self, args: &Args, force: bool) -> Result<bool, ClewdrError> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             self.repo_owner, self.repo_name
@@ -133,15 +241,62 @@ impl ClewdrUpdater {
             latest_version.green().italic(),
             current_version.yellow()
         );
-        // Auto update if enabled
-        if args.update || CLEWDR_CONFIG.load().auto_update {
+        // Auto update if enabled or forced via remote trigger
+        if force || args.update || CLEWDR_CONFIG.load().auto_update {
             self.perform_update(&release).await?;
         }
 
         Ok(true)
     }
 
-    /// Performs the update process
+    /// Performs the update from a custom URL (direct binary download)
+    async fn perform_custom_update(&self, download_url: &str, latest_version: &str) -> Result<(), ClewdrError> {
+        info!("Downloading update from {}", download_url);
+
+        let response = self
+            .client
+            .get(download_url)
+            .header(USER_AGENT, &self.user_agent)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to download update from custom server",
+            })?
+            .error_for_status()
+            .context(WreqSnafu {
+                msg: "Download from custom server returned an error",
+            })?;
+
+        let content = response.bytes().await.context(WreqSnafu {
+            msg: "Failed to read response bytes from custom update",
+        })?;
+
+        // Create a temporary file for the binary
+        let temp_dir = tempfile::tempdir()?;
+        let binary_name = if cfg!(windows) { "clewdr.exe" } else { "clewdr" };
+        let binary_path = temp_dir.path().join(binary_name);
+
+        // Write the binary directly
+        std::fs::write(&binary_path, &content)?;
+
+        // Make the binary executable on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&binary_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&binary_path, perms)?;
+        }
+
+        // Replace the current binary
+        self_replace::self_replace(&binary_path)?;
+
+        println!("Successfully updated to version {}", latest_version.green());
+        println!("{}", "Update complete, closing...".green());
+        std::process::exit(0);
+    }
+
+    /// Performs the update process from GitHub
     /// Downloads the appropriate release asset, extracts it, and replaces the current binary
     ///
     /// # Arguments
